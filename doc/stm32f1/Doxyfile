@@ -22,6 +22,9 @@ INPUT                  = ../../include/libopencm3/license.dox \
 INPUT                 += ../../lib/stm32/f1 \
 			 ../../lib/stm32/common
 
+INPUT                 += ../../lib/usb/usb.c \
+			 ../../lib/usb/usb_control.c
+
 EXCLUDE                = ../../include/libopencm3/stm32/f1/usb.h \
 			 ../../include/libopencm3/stm32/f1/usb_desc.h
 

@@ -16,12 +16,22 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this library.  If not, see <http://www.gnu.org/licenses/>.
  */
-
 #include <stdlib.h>
 #include <libopencm3/usb/usbd.h>
 #include "usb_private.h"
 
-/* Register application callback function for handling USB control requests. */
+/** @addtogroup usb_file */
+/** @{ */
+
+/** @brief Register application callback function for handling USB control requests.
+
+@param[in] usbd_dev The USB device to interact with.
+@param[in] type TODO
+@param[in] type_ask TODO
+@param[in] callback TODO
+
+@return 0 if successful, -1 otherwise.
+*/
 int usbd_register_control_callback(usbd_device *usbd_dev, u8 type, u8 type_mask,
 				   usbd_control_callback callback)
 {
@@ -39,6 +49,7 @@ int usbd_register_control_callback(usbd_device *usbd_dev, u8 type, u8 type_mask,
 
 	return -1;
 }
+/**@}*/
 
 static void usb_control_send_chunk(usbd_device *usbd_dev)
 {

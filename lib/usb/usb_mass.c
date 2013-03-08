@@ -145,9 +145,12 @@ struct usb_mass_trans {
 
 	u32 bytes_to_read;
 	u32 bytes_to_write;
-	u32 count;		/* Either read until equal to bytes_to_read or
+	u32 byte_count;		/* Either read until equal to bytes_to_read or
 				   write until equal to bytes_to_write. */
-	u8 *data;
+	u32 lba_start;
+	u32 block_count;
+	u32 current_block;
+
 	u8 msd_buf[512];
 
 	bool csw_valid;
@@ -169,7 +172,12 @@ struct _usbd_mass_storage {
 	const char *product_id;
 	const char *product_revision_level;
 	u32 block_count;
-	u8 *lba_0_ptr;
+
+	int (*read_block)(u32 lba, u8 *copy_to);
+	int (*write_block)(u32 lba, const u8 *copy_from);
+
+	void (*lock)(void);
+	void (*unlock)(void);
 
 	struct usb_mass_trans trans;
 	struct sbc_sense_info sense;
@@ -212,26 +220,7 @@ static const u8 _spc3_request_sense[18] = {
 	0x00	/* Byte 17: SenseKeySpecific[0] = 0 */
 };
 
-static int mass_control_request(usbd_device *usbd_dev,
-				struct usb_setup_data *req, u8 **buf, u16 *len,
-				void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
-{
-	(void)complete;
-	(void)usbd_dev;
-
-	switch (req->bRequest) {
-	case USB_MASS_REQ_BULK_ONLY_RESET:
-		/* Do any special reset code here. */
-		return USBD_REQ_HANDLED;
-	case USB_MASS_REQ_GET_MAX_LUN:
-		/* Return the number of LUNs.  We use 0. */
-		*buf[0] = 0;
-		*len = 1;
-		return USBD_REQ_HANDLED;
-	}
-
-	return USBD_REQ_NOTSUPP;
-}
+/*-- SCSI Layer --------------------------------------------------------------*/
 
 static bool is_meaningful_cbw(struct usb_mass_cbw *cbw)
 {
@@ -273,17 +262,20 @@ static void scsi_read_6(usbd_mass_storage *ms,
 			enum trans_event event)
 {
 	if (EVENT_CBW_VALID == event) {
-		u32 lba;
-		u32 blocks;
 		u8 *buf;
 
 		buf = get_cbw_buf(trans);
-		lba = (buf[2] << 8) | buf[3];
-		blocks = buf[4];
+
+		trans->lba_start = (buf[2] << 8) | buf[3];
+		trans->block_count = buf[4];
+		trans->current_block = 0;
+
+		/* TODO: Check the lba & block_count for range. */
 
 		/* both are in terms of 512 byte blocks, so shift by 9 */
-		trans->data = &ms->lba_0_ptr[lba << 9];
-		trans->bytes_to_write = blocks << 9;
+		trans->bytes_to_write = trans->block_count << 9;
+
+		set_sbc_status_good(ms);
 	}
 }
 
@@ -293,17 +285,18 @@ static void scsi_read_10(usbd_mass_storage *ms,
 			 enum trans_event event)
 {
 	if (EVENT_CBW_VALID == event) {
-		u32 lba;
-		u32 blocks;
 		u8 *buf;
 
 		buf = get_cbw_buf(trans);
-		lba = (buf[2] << 24) | (buf[3] << 16) | (buf[4] << 8) | buf[5];
-		blocks = (buf[7] << 8) | buf[8];
+
+		trans->lba_start = (buf[2] << 24) | (buf[3] << 16) | (buf[4] << 8) | buf[5];
+		trans->block_count = (buf[7] << 8) | buf[8];
+
+		/* TODO: Check the lba & block_count for range. */
 
 		/* both are in terms of 512 byte blocks, so shift by 9 */
-		trans->data = &ms->lba_0_ptr[lba << 9];
-		trans->bytes_to_write = blocks << 9;
+		trans->bytes_to_write = trans->block_count << 9;
+
 		set_sbc_status_good(ms);
 	}
 }
@@ -349,16 +342,20 @@ static void scsi_mode_sense_6(usbd_mass_storage *ms,
 			      struct usb_mass_trans *trans,
 			      enum trans_event event)
 {
+	(void) ms;
+
 	if (EVENT_CBW_VALID == event) {
+#if 0
 		u8 *buf;
 		u8 page_code;
-		//u8 allocation_length;
+		u8 allocation_length;
 
 		buf = &trans->cbw.cbw.CBWCB[0];
 		page_code = buf[2];
-		//allocation_length = buf[4];
+		allocation_length = buf[4];
 
-		//if (0x1C == page_code) {	/* Informational Exceptions */
+		if (0x1C == page_code) {	/* Informational Exceptions */
+#endif
 			trans->bytes_to_write = 4;
 
 			trans->msd_buf[0] = 3;	/* Num bytes that follow */
@@ -386,16 +383,10 @@ static void scsi_inquiry(usbd_mass_storage *ms,
 {
 	if (EVENT_CBW_VALID == event) {
 		u8 evpd;
-		//u8 page_code;			// Needed?
-		//u16 allocation_length;	// Needed?
-		//u8 control;			// Needed?
 		u8 *buf;
 
 		buf = get_cbw_buf(trans);
 		evpd = 1 & buf[1];
-		//page_code = buf[2];
-		//allocation_length = (buf[3] << 8) | buf[4];
-		//control = buf[5];
 
 		if (0 == evpd) {
 			size_t len;
@@ -439,8 +430,7 @@ static void scsi_command(usbd_mass_storage *ms,
 
 		trans->bytes_to_write = 0;
 		trans->bytes_to_read = 0;
-		trans->count = 0;
-		trans->data = trans->msd_buf;
+		trans->byte_count = 0;
 	}
 
 	switch (trans->cbw.cbw.CBWCB[0]) {
@@ -467,9 +457,11 @@ static void scsi_command(usbd_mass_storage *ms,
 	case SCSI_READ_10:
 		scsi_read_10(ms, trans, event);
 		break;
-	//case SCSI_WRITE_6:
-	//case SCSI_SEND_DIAGNOSTIC:
-	//case SCSI_REPORT_LUNS:
+#if 0
+	case SCSI_WRITE_6:
+	case SCSI_SEND_DIAGNOSTIC:
+	case SCSI_REPORT_LUNS:
+#endif
 	default:
 		set_sbc_status(ms, SBC_SENSE_KEY_ILLEGAL_REQUEST,
 					SBC_ASC_INVALID_COMMAND_OPERATION_CODE,
@@ -477,12 +469,14 @@ static void scsi_command(usbd_mass_storage *ms,
 
 		trans->bytes_to_write = 0;
 		trans->bytes_to_read = 0;
-		trans->data = trans->msd_buf;
 		trans->csw.csw.bCSWStatus = CBW_STATUS_FAILED;
 		break;
 	}
 }
 
+/*-- USB Mass Storage Layer --------------------------------------------------*/
+
+/** @brief Handle the USB 'OUT' requests. */
 static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
 {
 	usbd_mass_storage *ms;
@@ -497,13 +491,13 @@ static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
 	left = sizeof(struct usb_mass_cbw) - trans->cbw_cnt;
 	if (0 < left) {
 		max_len = MIN(ms->ep_out_size, left);
-		p = &trans->cbw.buf[trans->cbw_cnt];
+		p = &trans->cbw.buf[0x1ff & trans->cbw_cnt];
 		len = usbd_ep_read_packet(usbd_dev, ep, p, max_len);
 		trans->cbw_cnt += len;
 
 		if (sizeof(struct usb_mass_cbw) == trans->cbw_cnt) {
 			scsi_command(ms, trans, EVENT_CBW_VALID);
-			if (trans->count < trans->bytes_to_read) {
+			if (trans->byte_count < trans->bytes_to_read) {
 				/* We must wait until there is something to
 				 * read again. */
 				return;
@@ -511,19 +505,61 @@ static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
 		}
 	}
 
-	if (trans->count < trans->bytes_to_read) {
-		left = trans->bytes_to_read - trans->count;
+	if (trans->byte_count < trans->bytes_to_read) {
+		if (0 < trans->block_count) {
+			if ((0 == trans->byte_count) && (NULL != ms->lock)){
+				(*ms->lock)();
+			}
+		}
+
+		left = trans->bytes_to_read - trans->byte_count;
 		max_len = MIN(ms->ep_out_size, left);
-		p = &trans->data[trans->count];
+		p = &trans->msd_buf[0x1ff & trans->byte_count];
 		len = usbd_ep_read_packet(usbd_dev, ep, p, max_len);
-		trans->count += len;
-	} else if (trans->count < trans->bytes_to_write) {
-		left = trans->bytes_to_write - trans->count;
+		trans->byte_count += len;
+
+		if (0 < trans->block_count) {
+			if (0 == (0x1ff & trans->byte_count)) {
+				u32 lba;
+
+				lba = trans->lba_start + trans->current_block;
+				if (0 != (*ms->write_block)(lba, trans->msd_buf)) {
+					/* Error */
+				}
+				trans->current_block++;
+			}
+		}
+	} else if (trans->byte_count < trans->bytes_to_write) {
+		if (0 < trans->block_count) {
+			if ((0 == trans->byte_count) && (NULL != ms->lock)) {
+				(*ms->lock)();
+			}
+
+			if (0 == (0x1ff & trans->byte_count)) {
+				u32 lba;
+
+				lba = trans->lba_start + trans->current_block;
+				if (0 != (*ms->read_block)(lba, trans->msd_buf)) {
+					/* Error */
+				}
+				trans->current_block++;
+			}
+		}
+
+		left = trans->bytes_to_write - trans->byte_count;
 		max_len = MIN(ms->ep_out_size, left);
-		p = &trans->data[trans->count];
+		p = &trans->msd_buf[0x1ff & trans->byte_count];
 		len = usbd_ep_write_packet(usbd_dev, ms->ep_in, p, max_len);
-		trans->count += len;
+		trans->byte_count += len;
 	} else {
+		if (0 < trans->block_count) {
+			if (trans->current_block == trans->block_count) {
+				trans->current_block = 0;
+				if (NULL != ms->unlock){
+					(*ms->unlock)();
+				}
+			}
+		}
 		if (false == trans->csw_valid) {
 			scsi_command(ms, trans, EVENT_NEED_STATUS);
 			trans->csw_valid = true;
@@ -533,15 +569,13 @@ static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
 		if (0 < left) {
 			max_len = MIN(ms->ep_out_size, left);
 			p = &trans->csw.buf[trans->csw_sent];
-			if (0xa5 == trans->csw.buf[0]) {
-				memset(trans->csw.buf, 0xc7, sizeof(struct usb_mass_csw));
-			}
 			len = usbd_ep_write_packet(usbd_dev, ms->ep_in, p, max_len);
 			trans->csw_sent += len;
 		}
 	}
 }
 
+/** @brief Handle the USB 'IN' requests. */
 static void mass_data_tx_cb(usbd_device *usbd_dev, u8 ep)
 {
 	usbd_mass_storage *ms;
@@ -552,13 +586,33 @@ static void mass_data_tx_cb(usbd_device *usbd_dev, u8 ep)
 	ms = &_mass_storage;
 	trans = &ms->trans;
 
-	if (trans->count < trans->bytes_to_write) {
-		left = trans->bytes_to_write - trans->count;
+	if (trans->byte_count < trans->bytes_to_write) {
+		if (0 < trans->block_count) {
+			if (0 == (0x1ff & trans->byte_count)) {
+				u32 lba;
+
+				lba = trans->lba_start + trans->current_block;
+				if (0 != (*ms->read_block)(lba, trans->msd_buf)) {
+					/* Error */
+				}
+				trans->current_block++;
+			}
+		}
+
+		left = trans->bytes_to_write - trans->byte_count;
 		max_len = MIN(ms->ep_out_size, left);
-		p = &trans->data[trans->count];
+		p = &trans->msd_buf[0x1ff & trans->byte_count];
 		len = usbd_ep_write_packet(usbd_dev, ep, p, max_len);
-		trans->count += len;
+		trans->byte_count += len;
 	} else {
+		if (0 < trans->block_count) {
+			if (trans->current_block == trans->block_count) {
+				trans->current_block = 0;
+				if (NULL != ms->unlock){
+					(*ms->unlock)();
+				}
+			}
+		}
 		if (false == trans->csw_valid) {
 			scsi_command(ms, trans, EVENT_NEED_STATUS);
 			trans->csw_valid = true;
@@ -568,25 +622,48 @@ static void mass_data_tx_cb(usbd_device *usbd_dev, u8 ep)
 		if (0 < left) {
 			max_len = MIN(ms->ep_out_size, left);
 			p = &trans->csw.buf[trans->csw_sent];
-			if (0xa5 == trans->csw.buf[0]) {
-				memset(trans->csw.buf, 0xb6, sizeof(struct usb_mass_csw));
-			}
 			len = usbd_ep_write_packet(usbd_dev, ep, p, max_len);
 			trans->csw_sent += len;
 		} else if (sizeof(struct usb_mass_csw) == trans->csw_sent) {
 			/* End of transaction */
+			trans->lba_start = 0xffffffff;
+			trans->block_count = 0;
+			trans->current_block = 0;
 			trans->cbw_cnt = 0;
 			trans->bytes_to_read = 0;
 			trans->bytes_to_write = 0;
-			trans->count = 0;
+			trans->byte_count = 0;
 			trans->csw_sent = 0;
 			trans->csw_valid = false;
-			trans->data = trans->msd_buf;
-			memset(trans->csw.buf, 0xa5, sizeof(struct usb_mass_csw));
 		}
 	}
 }
 
+/** @brief Handle various control requests related to the mass storage
+ *	   interface.
+ */
+static int mass_control_request(usbd_device *usbd_dev,
+				struct usb_setup_data *req, u8 **buf, u16 *len,
+				void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
+{
+	(void)complete;
+	(void)usbd_dev;
+
+	switch (req->bRequest) {
+	case USB_MASS_REQ_BULK_ONLY_RESET:
+		/* Do any special reset code here. */
+		return USBD_REQ_HANDLED;
+	case USB_MASS_REQ_GET_MAX_LUN:
+		/* Return the number of LUNs.  We use 0. */
+		*buf[0] = 0;
+		*len = 1;
+		return USBD_REQ_HANDLED;
+	}
+
+	return USBD_REQ_NOTSUPP;
+}
+
+/** @brief Setup the endpoints to be bulk & register the callbacks. */
 static void mass_set_config(usbd_device *usbd_dev, u16 wValue)
 {
 	usbd_mass_storage *ms = &_mass_storage;
@@ -605,6 +682,9 @@ static void mass_set_config(usbd_device *usbd_dev, u16 wValue)
 				mass_control_request);
 }
 
+/** @addtogroup usb_mass */
+/** @{ */
+
 /** @brief Initializes the USB Mass Storage subsystem.
 
 @note Currently you can only have this profile active.
@@ -614,6 +694,15 @@ static void mass_set_config(usbd_device *usbd_dev, u16 wValue)
 @param[in] ep_in_size The maximum endpoint size.  Valid values: 8, 16, 32 or 64
 @param[in] ep_out The USB 'OUT' endpoint.
 @param[in] ep_out_size The maximum endpoint size.  Valid values: 8, 16, 32 or 64
+@param[in] vendor_id The SCSI vendor ID to return.  Maximum used length is 8.
+@param[in] product_id The SCSI product ID to return.  Maximum used length is 16.
+@param[in] product_revision_level The SCSI product revision level to return.
+		Maximum used length is 4.
+@param[in] block_count The number of 512-byte blocks available.
+@param[in] read_block The function called when the host requests to read a LBA
+		block.  Must _NOT_ be NULL.
+@param[in] write_block The function called when the host requests to write a
+		LBA block.  Must _NOT_ be NULL.
 
 @return Pointer to the usbd_mass_storage struct.
 */
@@ -622,35 +711,11 @@ usbd_mass_storage *usb_mass_init(usbd_device *usbd_dev,
 				 u8 ep_out, u8 ep_out_size,
 				 const char *vendor_id,
 				 const char *product_id,
-				 const char *product_revision_level)
+				 const char *product_revision_level,
+				 const u32 block_count,
+				 int (*read_block)(u32 lba, u8 *copy_to),
+				 int (*write_block)(u32 lba, const u8 *copy_from))
 {
-	static u8 buffer[512 * 20];
-	int i;
-	/* Error Check? */
-#if 0
-	if (0x80 & ep_out) {
-		return NULL;
-	}
-
-	if (!(0x80 & ep_in)) {
-		return NULL;
-	}
-
-	if ((8 != ep_in_size) && (16 != ep_in_size) &&
-	    (32 != ep_in_size) && (64 != ep_in_size))
-	{
-		return NULL;
-	}
-
-	if ((8 != ep_out_size) && (16 != ep_out_size) &&
-	    (32 != ep_out_size) && (64 != ep_out_size)) {
-		return NULL;
-	}
-#endif
-	for( i = 0; i < 20; i++ ) {
-		memset(&buffer[512 * i], i, 512);
-	}
-
 	_mass_storage.usbd_dev = usbd_dev;
 	_mass_storage.ep_in = ep_in;
 	_mass_storage.ep_in_size = ep_in_size;
@@ -659,13 +724,19 @@ usbd_mass_storage *usb_mass_init(usbd_device *usbd_dev,
 	_mass_storage.vendor_id = vendor_id;
 	_mass_storage.product_id = product_id;
 	_mass_storage.product_revision_level = product_revision_level;
-	_mass_storage.block_count = 20 - 1;
-	_mass_storage.lba_0_ptr = buffer;
+	_mass_storage.block_count = block_count - 1;
+	_mass_storage.read_block = read_block;
+	_mass_storage.write_block = write_block;
+	_mass_storage.lock = NULL;
+	_mass_storage.unlock = NULL;
 
+	_mass_storage.trans.lba_start = 0xffffffff;
+	_mass_storage.trans.block_count = 0;
+	_mass_storage.trans.current_block = 0;
 	_mass_storage.trans.cbw_cnt = 0;
 	_mass_storage.trans.bytes_to_read = 0;
 	_mass_storage.trans.bytes_to_write = 0;
-	_mass_storage.trans.count = 0;
+	_mass_storage.trans.byte_count = 0;
 	_mass_storage.trans.csw_valid = false;
 	_mass_storage.trans.csw_sent = 0;
 
@@ -675,3 +746,5 @@ usbd_mass_storage *usb_mass_init(usbd_device *usbd_dev,
 
 	return &_mass_storage;
 }
+
+/** @} */

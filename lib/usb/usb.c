@@ -6,6 +6,14 @@
 
 */
 
+/** @defgroup usb_mass USB
+
+@ingroup STM32F1xx
+
+@brief <b>libopencm3 STM32F1xx USB Mass Storage</b>
+
+*/
+
 /*
  * This file is part of the libopencm3 project.
  *
@@ -35,7 +43,6 @@
 u8 usbd_control_buffer[128] __attribute__((weak));
 
 /** @brief Main initialization entry point.
-
 Initialize the USB firmware library to implement the USB device described
 by the descriptors provided.
 

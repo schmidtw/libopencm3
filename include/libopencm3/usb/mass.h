@@ -63,6 +63,9 @@ usbd_mass_storage *usb_mass_init(usbd_device *usbd_dev,
 				 u8 ep_out, u8 ep_out_size,
 				 const char *vendor_id,
 				 const char *product_id,
-				 const char *product_revision_level);
+				 const char *product_revision_level,
+                 const u32 block_count,
+				 int (*read_block)(u32 lba, u8 *copy_to),
+				 int (*write_block)(u32 lba, const u8 *copy_from));
 
 #endif

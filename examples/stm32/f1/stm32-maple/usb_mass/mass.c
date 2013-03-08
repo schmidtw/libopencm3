@@ -99,111 +99,23 @@ static const char *usb_strings[] = {
 	"0123456789ABCDEF",
 };
 
-#if 0
-static int mass_control_request(usbd_device *usbd_dev, struct usb_setup_data *req, u8 **buf,
-		u16 *len, void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req))
+static int read_block(u32 lba, u8 *copy_to)
 {
-	(void)complete;
-	(void)usbd_dev;
-
-	switch (req->bRequest) {
-	case USB_MASS_REQ_BULK_ONLY_RESET:
-		/* Do any special reset code here. */
-		return USBD_REQ_HANDLED;
-	case USB_MASS_REQ_GET_MAX_LUN:
-		/* Return the number of LUNs.  We use 0. */
-		*buf[0] = 0;
-		*len = 1;
-		return USBD_REQ_HANDLED;
-	}
-
-	return USBD_REQ_NOTSUPP;
+    int i;
+    
+    for (i = 0; i < 512; i++) {
+        copy_to[i] = 0xff & lba;
+    }
+    return 0;
 }
 
-static bool is_valid_cbw(struct usb_mass_cbw *cbw, u16 size)
+static int write_block(u32 lba, const u8 *copy_from)
 {
-	if ((size == sizeof(struct usb_mass_cbw)) &&
-	    (USB_MASS_CBW_SIGNATURE == cbw->dCBWSignature))
-	{
-		return true;
-	}
+    (void) lba;
+    (void) copy_from;
 
-	return false;
+    return 0;
 }
-
-static bool is_meaningful_cbw(struct usb_mass_cbw *cbw)
-{
-	if ((cbw->bCBWLUN < 16) &&
-	    ((0 < cbw->bCBWCBLength) && (cbw->bCBWCBLength <= 16)) &&
-	    (0 == (0x7f & cbw->bmCBWFlags)))
-	{
-		return true;
-	}
-
-	return false;
-}
-
-static void csw_set_failure(struct usb_mass_csw *csw, u32 tag)
-{
-	csw->dCSWSignature = USB_MASS_CBW_SIGNATURE;
-	csw->dCSWTag = tag
-	csw->dCSWDataResidue = 0x24;
-	csw->bCSWStatus = 1;
-}
-
-static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
-{
-	static bool expect_cbw = true;
-	u8 buf[64];
-	int len;
-	struct usb_mass_cbw *cbw;
-	struct usb_mass_csw csw;
-
-	(void)ep;
-
-	len = usbd_ep_read_packet(usbd_dev, ep, buf, 64);
-
-	if (true == expect_cbw) {
-		if (31 != len) {
-			goto error;
-		}
-
-		cbw = (struct usb_mass_cbw*) buf;
-
-		if (USB_MASS_CBW_SIGNATURE != cbw->dCBWSignature) {
-			goto error;
-		}
-
-		csw.dCSWSignature = USB_MASS_CBW_SIGNATURE;
-		csw.dCSWTag = cbw->dCBWTag;
-		csw.dCSWDataResidue = 0x24;
-		csw.bCSWStatus = 0;
-
-		usbd_ep_write_packet(usbd_dev, 0x81, &csw, sizeof(csw));
-	} else {
-	}
-
-	return;
-
-error:
-	usbd_ep_stall_set(usbd_dev, 0x02, 1);
-}
-
-static void mass_set_config(usbd_device *usbd_dev, u16 wValue)
-{
-	(void)wValue;
-	(void)usbd_dev;
-
-	usbd_ep_setup(usbd_dev, 0x02, USB_ENDPOINT_ATTR_BULK, 64, mass_data_rx_cb);
-	usbd_ep_setup(usbd_dev, 0x81, USB_ENDPOINT_ATTR_BULK, 64, NULL);
-
-	usbd_register_control_callback(
-				usbd_dev,
-				USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
-				USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
-				mass_control_request);
-}
-#endif
 
 int main(void)
 {
@@ -230,8 +142,7 @@ int main(void)
 		      GPIO_CNF_OUTPUT_PUSHPULL, GPIO5);
 
 	usbd_dev = usbd_init(&stm32f103_usb_driver, &dev, &config, usb_strings, 3);
-	usb_mass_init(usbd_dev, 0x81, 64, 0x02, 64, "Wes", "TD-1", "0.00");
-	//usbd_register_set_config_callback(usbd_dev, mass_set_config);
+	usb_mass_init(usbd_dev, 0x81, 64, 0x02, 64, "Wes", "Project-Wes", "0.00", 20, read_block, write_block);
 
 	for (i = 0; i < 0x800000; i++)
 		__asm__("nop");

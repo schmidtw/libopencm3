@@ -99,21 +99,17 @@ static const char *usb_strings[] = {
 	"0123456789ABCDEF",
 };
 
+static u8 data[512 * 5];
+
 static int read_block(u32 lba, u8 *copy_to)
 {
-    int i;
-    
-    for (i = 0; i < 512; i++) {
-        copy_to[i] = 0xff & lba;
-    }
+    memcpy(copy_to, &data[lba << 9], 512);
     return 0;
 }
 
 static int write_block(u32 lba, const u8 *copy_from)
 {
-    (void) lba;
-    (void) copy_from;
-
+    memcpy(&data[lba << 9], copy_from, 512);
     return 0;
 }
 
@@ -142,7 +138,7 @@ int main(void)
 		      GPIO_CNF_OUTPUT_PUSHPULL, GPIO5);
 
 	usbd_dev = usbd_init(&stm32f103_usb_driver, &dev, &config, usb_strings, 3);
-	usb_mass_init(usbd_dev, 0x81, 64, 0x02, 64, "Wes", "Project-Wes", "0.00", 20, read_block, write_block);
+	usb_mass_init(usbd_dev, 0x81, 64, 0x02, 64, "Wes", "Project-Wes", "0.00", 5, read_block, write_block);
 
 	for (i = 0; i < 0x800000; i++)
 		__asm__("nop");

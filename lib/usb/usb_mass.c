@@ -42,24 +42,27 @@
 #define CBW_STATUS_FAILED		1
 #define CBW_STATUS_PHASE_ERROR		2
 
+/* Implemented SCSI Commands */
+#define SCSI_TEST_UNIT_READY			0x00
+#define SCSI_REQUEST_SENSE			0x03
+#define SCSI_FORMAT_UNIT			0x04
+#define SCSI_READ_6				0x08
+#define SCSI_WRITE_6				0x0A
+#define SCSI_INQUIRY				0x12
+#define SCSI_MODE_SENSE_6			0x1A
+#define SCSI_SEND_DIAGNOSTIC			0x1D
+#define SCSI_READ_CAPACITY			0x25
+#define SCSI_READ_10				0x28
+
+
 /* Required SCSI Commands */
-#define SCSI_FORMAT_UNIT		0x04
-#define SCSI_INQUIRY			0x12
-#define SCSI_READ_6			0x08
-#define SCSI_READ_10			0x28
-#define SCSI_READ_CAPACITY		0x25
-#define SCSI_REPORT_LUNS		0xA0
-#define SCSI_REQUEST_SENSE		0x03
-#define SCSI_SEND_DIAGNOSTIC		0x1D
-#define SCSI_TEST_UNIT_READY		0x00
-#define SCSI_WRITE_6			0x0A
 
 /* Optional SCSI Commands */
+#define SCSI_REPORT_LUNS			0xA0
+#define SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL	0x1E
 #define SCSI_MODE_SELECT_6			0x15
 #define SCSI_MODE_SELECT_10			0x55
-#define SCSI_MODE_SENSE_6			0x1A
 #define SCSI_MODE_SENSE_10			0x5A
-#define SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL	0x1E
 #define SCSI_READ_12				0xA8
 #define SCSI_READ_FORMAT_CAPACITIES		0x23
 #define SCSI_READ_TOC_PMA_ATIP			0x43
@@ -185,14 +188,16 @@ struct _usbd_mass_storage {
 
 static usbd_mass_storage _mass_storage;
 
+/*-- SCSI Base Responses -----------------------------------------------------*/
+
 static const u8 _spc3_inquiry_response[36] = {
 	0x00,	/* Byte 0: Peripheral Qualifier = 0, Peripheral Device Type = 0 */
 	0x80,	/* Byte 1: RMB = 1, Reserved = 0 */
-	0x05,	/* Byte 2: Version = 0 */
+	0x04,	/* Byte 2: Version = 0 */
 	0x02,	/* Byte 3: Obsolete = 0, NormACA = 0, HiSup = 0, Response Data Format = 2 */
 	0x20,	/* Byte 4: Additional Length (n-4) = 31 + 4 */
 	0x00,	/* Byte 5: SCCS = 0, ACC = 0, TPGS = 0, 3PC = 0, Reserved = 0, Protect = 0 */
-	0x80,	/* Byte 6: BQue = 1, EncServ = 0, VS = 0, MultiP = 0, MChngr = 0, Obsolete = 0, Addr16 = 0 */
+	0x00,	/* Byte 6: BQue = 0, EncServ = 0, VS = 0, MultiP = 0, MChngr = 0, Obsolete = 0, Addr16 = 0 */
 	0x00,	/* Byte 7: Obsolete = 0, Wbus16 = 0, Sync = 0, Linked = 0, CmdQue = 0, VS = 0 */
 		/* Byte 8 - Byte 15: Vendor Identification */
 	0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
@@ -221,18 +226,6 @@ static const u8 _spc3_request_sense[18] = {
 };
 
 /*-- SCSI Layer --------------------------------------------------------------*/
-
-static bool is_meaningful_cbw(struct usb_mass_cbw *cbw)
-{
-	if ((cbw->bCBWLUN < 16) &&
-	    ((0 < cbw->bCBWCBLength) && (cbw->bCBWCBLength <= 16)) &&
-	    (0 == (0x7f & cbw->bmCBWFlags)))
-	{
-		return true;
-	}
-
-	return false;
-}
 
 static void set_sbc_status(usbd_mass_storage *ms,
 			   enum sbc_sense_key key, 
@@ -279,6 +272,44 @@ static void scsi_read_6(usbd_mass_storage *ms,
 	}
 }
 
+static void scsi_write_6(usbd_mass_storage *ms,
+			 struct usb_mass_trans *trans,
+			 enum trans_event event)
+{
+	(void) ms;
+
+	if (EVENT_CBW_VALID == event) {
+		u8 *buf;
+
+		buf = get_cbw_buf(trans);
+
+		trans->lba_start = ((0x1f & buf[1]) << 16) | (buf[2] << 8) | buf[3];
+		trans->block_count = buf[4];
+		trans->current_block = 0;
+
+		trans->bytes_to_read = trans->block_count << 9;
+	}
+}
+
+static void scsi_write_10(usbd_mass_storage *ms,
+			  struct usb_mass_trans *trans,
+			  enum trans_event event)
+{
+	(void) ms;
+
+	if (EVENT_CBW_VALID == event) {
+		u8 *buf;
+
+		buf = get_cbw_buf(trans);
+
+		trans->lba_start = (buf[2] << 24) | (buf[3] << 16) |
+					(buf[4] << 8) | buf[5];
+		trans->block_count = (buf[7] << 8) | buf[8];
+		trans->current_block = 0;
+
+		trans->bytes_to_read = trans->block_count << 9;
+	}
+}
 
 static void scsi_read_10(usbd_mass_storage *ms,
 			 struct usb_mass_trans *trans,
@@ -321,6 +352,23 @@ static void scsi_read_capacity(usbd_mass_storage *ms,
 	}
 }
 
+static void scsi_format_unit(usbd_mass_storage *ms,
+			     struct usb_mass_trans *trans,
+			     enum trans_event event)
+{
+	if (EVENT_CBW_VALID == event) {
+		u32 i;
+
+		memset(trans->msd_buf, 0, 512);
+
+		for (i = 0; i < ms->block_count; i++) {
+			(*ms->write_block)(i, trans->msd_buf);
+		}
+
+		set_sbc_status_good(ms);
+	}
+}
+
 static void scsi_request_sense(usbd_mass_storage *ms,
 			       struct usb_mass_trans *trans,
 			       enum trans_event event)
@@ -329,6 +377,7 @@ static void scsi_request_sense(usbd_mass_storage *ms,
 		u8 *buf;
 
 		buf = &trans->cbw.cbw.CBWCB[0];
+
 		trans->bytes_to_write = buf[4];	/* allocation length */
 		memcpy(trans->msd_buf, _spc3_request_sense, sizeof(_spc3_request_sense));
 
@@ -434,10 +483,13 @@ static void scsi_command(usbd_mass_storage *ms,
 	}
 
 	switch (trans->cbw.cbw.CBWCB[0]) {
-	case SCSI_PREVENT_ALLOW_MEDIUM_REMOVAL:
 	case SCSI_TEST_UNIT_READY:
+	case SCSI_SEND_DIAGNOSTIC:
 		/* Do nothing, just send the success. */
 		set_sbc_status_good(ms);
+		break;
+	case SCSI_FORMAT_UNIT:
+		scsi_format_unit(ms, trans, event);
 		break;
 	case SCSI_REQUEST_SENSE:
 		scsi_request_sense(ms, trans, event);
@@ -457,11 +509,12 @@ static void scsi_command(usbd_mass_storage *ms,
 	case SCSI_READ_10:
 		scsi_read_10(ms, trans, event);
 		break;
-#if 0
 	case SCSI_WRITE_6:
-	case SCSI_SEND_DIAGNOSTIC:
-	case SCSI_REPORT_LUNS:
-#endif
+		scsi_write_6(ms, trans, event);
+		break;
+	case SCSI_WRITE_10:
+		scsi_write_10(ms, trans, event);
+		break;
 	default:
 		set_sbc_status(ms, SBC_SENSE_KEY_ILLEGAL_REQUEST,
 					SBC_ASC_INVALID_COMMAND_OPERATION_CODE,
@@ -527,6 +580,14 @@ static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
 					/* Error */
 				}
 				trans->current_block++;
+		{
+			u8 foo[20] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+			foo[3] = 0xff & (trans->byte_count >> 24);
+			foo[4] = 0xff & (trans->byte_count >> 16);
+			foo[5] = 0xff & (trans->byte_count >> 8);
+			foo[6] = 0xff & trans->byte_count;
+			usbd_ep_write_packet(usbd_dev, ms->ep_in, foo, 8);
+		}
 			}
 		}
 	} else if (trans->byte_count < trans->bytes_to_write) {
@@ -554,6 +615,13 @@ static void mass_data_rx_cb(usbd_device *usbd_dev, u8 ep)
 	} else {
 		if (0 < trans->block_count) {
 			if (trans->current_block == trans->block_count) {
+				u32 lba;
+
+				lba = trans->lba_start + trans->current_block;
+				if (0 != (*ms->write_block)(lba, trans->msd_buf)) {
+					/* Error */
+				}
+
 				trans->current_block = 0;
 				if (NULL != ms->unlock){
 					(*ms->unlock)();
